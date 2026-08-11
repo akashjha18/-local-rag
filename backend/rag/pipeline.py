@@ -32,7 +32,6 @@ from backend.rag.llm import OllamaLLM
 from backend.models.document_models import (
     IngestResult,
     RAGResponse,
-    DocumentType,
 )
 from backend.config import get_settings
 from backend.utils.logger import logger
@@ -52,17 +51,9 @@ class RAGPipeline:
         llm_model:     Override default Ollama model from config
 
     Usage:
-        # At startup — create once
         pipeline = RAGPipeline()
-
-        # Ingest a document
         result = pipeline.ingest("path/to/document.pdf")
-
-        # Ask a question
         response = pipeline.ask("What is the main finding?")
-
-        # Delete a document
-        pipeline.delete_document(document_id)
     """
 
     def __init__(
@@ -79,7 +70,6 @@ class RAGPipeline:
         start = time.time()
 
         # ── Component 1: Document Processors ──────────────────────
-        # Stateless — safe to share as singletons
         self.pdf_processor = PDFProcessor()
         self.docx_processor = DOCXProcessor()
 
@@ -90,12 +80,9 @@ class RAGPipeline:
         )
 
         # ── Component 3: Embedding Service ────────────────────────
-        # Loads the transformer model into memory (~2 seconds)
-        # This is the most expensive initialization step
         self.embedding_service = EmbeddingService()
 
         # ── Component 4: Vector Store ──────────────────────────────
-        # Loads existing FAISS index from disk if it exists
         self.vector_store = FAISSVectorStore(
             index_path=settings.faiss_index_file,
             metadata_path=settings.faiss_metadata_file,
@@ -103,7 +90,6 @@ class RAGPipeline:
         )
 
         # ── Component 5: Retriever ─────────────────────────────────
-        # Wires embedding service + vector store together
         self.retriever = Retriever(
             embedding_service=self.embedding_service,
             vector_store=self.vector_store,
@@ -111,7 +97,6 @@ class RAGPipeline:
         )
 
         # ── Component 6: LLM ──────────────────────────────────────
-        # Connects to local Ollama server
         self.llm = OllamaLLM(
             model=llm_model or settings.ollama_model,
         )
@@ -135,19 +120,17 @@ class RAGPipeline:
         self,
         file_path: str | Path,
         document_id: Optional[str] = None,
+        original_filename: Optional[str] = None,
     ) -> IngestResult:
         """
         Process and index a document file (PDF or DOCX).
 
-        Full pipeline:
-          file → detect type → extract text → chunk →
-          embed → store in FAISS → return result
-
         Args:
-            file_path:   Path to the PDF or DOCX file
-            document_id: Optional ID. Auto-generated if not provided.
-                         Use a stable ID (e.g., DB primary key) so
-                         you can delete the document later.
+            file_path:         Path to the PDF or DOCX file on disk
+            document_id:       Unique ID. Auto-generated if not provided.
+            original_filename: The real filename to show users.
+                               file_path may have a UUID prefix for storage.
+                               If not provided, uses file_path.name.
 
         Returns:
             IngestResult with stats. Never raises.
@@ -155,13 +138,14 @@ class RAGPipeline:
         start = time.time()
         file_path = Path(file_path)
 
-        # ── Generate document ID if not provided ───────────────────
         if not document_id:
-            # UUID ensures uniqueness across sessions
             document_id = str(uuid.uuid4())
 
+        # Use original_filename for display, file_path.name for processing
+        display_name = original_filename or file_path.name
+
         logger.info(
-            f"Pipeline ingesting: {file_path.name} "
+            f"Pipeline ingesting: {display_name} "
             f"(id={document_id})"
         )
 
@@ -176,7 +160,7 @@ class RAGPipeline:
             else:
                 return IngestResult(
                     document_id=document_id,
-                    filename=file_path.name,
+                    filename=display_name,
                     chunks_indexed=0,
                     processing_time=time.time() - start,
                     status="failed",
@@ -187,10 +171,10 @@ class RAGPipeline:
                 )
 
         except Exception as e:
-            logger.error(f"Processing failed for {file_path.name}: {e}")
+            logger.error(f"Processing failed for {display_name}: {e}")
             return IngestResult(
                 document_id=document_id,
-                filename=file_path.name,
+                filename=display_name,
                 chunks_indexed=0,
                 processing_time=time.time() - start,
                 status="failed",
@@ -201,7 +185,7 @@ class RAGPipeline:
         if not document.is_successful:
             return IngestResult(
                 document_id=document_id,
-                filename=file_path.name,
+                filename=display_name,
                 chunks_indexed=0,
                 processing_time=time.time() - start,
                 status="failed",
@@ -209,20 +193,26 @@ class RAGPipeline:
                 page_count=document.metadata.page_count,
             )
 
+        # ── KEY FIX: Override stored filename with original name ───
+        # The file on disk has a UUID prefix (e.g. "abc123_report.pdf")
+        # but we want FAISS metadata and UI to show "report.pdf"
+        if original_filename:
+            document.metadata.filename = original_filename
+
         # ── Index the document ─────────────────────────────────────
         index_result = self.retriever.index_document(document, document_id)
 
         elapsed = time.time() - start
 
         logger.info(
-            f"Ingest complete: {file_path.name} | "
+            f"Ingest complete: {display_name} | "
             f"Chunks: {index_result['chunks_indexed']} | "
             f"Time: {elapsed:.2f}s"
         )
 
         return IngestResult(
             document_id=document_id,
-            filename=file_path.name,
+            filename=display_name,
             chunks_indexed=index_result["chunks_indexed"],
             processing_time=elapsed,
             status=index_result["status"],
@@ -243,10 +233,6 @@ class RAGPipeline:
     ) -> RAGResponse:
         """
         Answer a question using the indexed documents.
-
-        Full pipeline:
-          query → embed → FAISS search → retrieve chunks →
-          build prompt → LLM generate → return answer + sources
 
         Args:
             query:              The user's question
@@ -352,10 +338,8 @@ class RAGPipeline:
     def get_stats(self) -> dict:
         """
         Return full system status.
-        Used by the /health API endpoint.
+        Used by the /health and /stats API endpoints.
         """
-        retriever_stats = self.retriever.get_stats()
-
         return {
             "pipeline_ready": True,
             "llm_available": self.llm.is_available(),

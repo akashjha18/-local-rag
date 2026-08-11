@@ -1,18 +1,16 @@
 """
 documents.py — Document Management Endpoints
 =============================================
-POST   /api/v1/documents          → Upload and index a document
-GET    /api/v1/documents          → List all indexed documents
-DELETE /api/v1/documents/{id}     → Remove a document
+POST   /api/v1/documents              → Upload and index a document
+GET    /api/v1/documents              → List all indexed documents
+DELETE /api/v1/documents/{id}         → Remove a document
 POST   /api/v1/documents/{id}/reindex → Re-index a document
 """
 
-import shutil
 import uuid
 from pathlib import Path
 
 from fastapi import APIRouter, File, HTTPException, Request, UploadFile
-from fastapi.responses import JSONResponse
 
 from backend.config import get_settings
 from backend.models.request_models import (
@@ -24,7 +22,6 @@ from backend.utils.logger import logger
 
 router = APIRouter(prefix="/api/v1/documents", tags=["documents"])
 
-# Allowed file extensions
 ALLOWED_EXTENSIONS = {".pdf", ".docx"}
 MAX_FILE_SIZE_MB = 50
 
@@ -44,16 +41,20 @@ async def upload_document(
 
     Steps:
     1. Validate file type and size
-    2. Save to data/documents/
-    3. Process (extract text, chunk, embed)
+    2. Save to data/documents/ with UUID prefix
+    3. Process with original filename stored in metadata
     4. Store in FAISS index
-    5. Return indexing statistics
+    5. Return indexing statistics with real filename
     """
     pipeline = request.app.state.pipeline
     settings = get_settings()
 
+    # ── Save the original filename before any modification ─────────
+    # This is what we show to users in the UI and source citations
+    original_filename = file.filename
+
     # ── Validate file extension ────────────────────────────────────
-    suffix = Path(file.filename).suffix.lower()
+    suffix = Path(original_filename).suffix.lower()
     if suffix not in ALLOWED_EXTENSIONS:
         raise HTTPException(
             status_code=400,
@@ -83,12 +84,13 @@ async def upload_document(
     # ── Generate unique document ID ────────────────────────────────
     document_id = str(uuid.uuid4())
 
-    # ── Save file to disk ──────────────────────────────────────────
+    # ── Save file to disk with UUID prefix ─────────────────────────
+    # UUID prefix prevents filename collisions when multiple users
+    # upload files with the same name
     docs_dir = Path(settings.documents_dir)
     docs_dir.mkdir(parents=True, exist_ok=True)
 
-    # Use document_id in filename to avoid collisions
-    safe_filename = f"{document_id}_{file.filename}"
+    safe_filename = f"{document_id}_{original_filename}"
     file_path = docs_dir / safe_filename
 
     try:
@@ -102,14 +104,17 @@ async def upload_document(
         )
 
     # ── Ingest into pipeline ───────────────────────────────────────
+    # Pass original_filename so FAISS metadata stores "report.pdf"
+    # not "abc123-uuid_report.pdf"
     logger.info(
-        f"Starting ingest: {file.filename} "
+        f"Starting ingest: {original_filename} "
         f"({size_mb:.2f}MB, id={document_id})"
     )
 
     result = pipeline.ingest(
         file_path=file_path,
         document_id=document_id,
+        original_filename=original_filename,  # ← THE KEY FIX
     )
 
     if result.status == "failed":
@@ -121,14 +126,14 @@ async def upload_document(
         )
 
     logger.info(
-        f"Ingest complete: {file.filename} | "
+        f"Ingest complete: {original_filename} | "
         f"chunks={result.chunks_indexed} | "
         f"time={result.processing_time:.2f}s"
     )
 
     return IngestResponse(
         document_id=result.document_id,
-        filename=file.filename,         # Return original name, not UUID name
+        filename=original_filename,        # Always return real filename
         chunks_indexed=result.chunks_indexed,
         page_count=result.page_count,
         word_count=result.word_count,
@@ -172,9 +177,7 @@ async def delete_document(
 ) -> DeleteResponse:
     """
     Delete a document from the vector index by its ID.
-
-    Note: This removes the document from the search index.
-    The original file in data/documents/ is also removed.
+    Also removes the original file from data/documents/.
     """
     pipeline = request.app.state.pipeline
 
@@ -235,19 +238,25 @@ async def reindex_document(
 
     file_path = matching_files[0]
 
+    # Extract original filename by removing UUID prefix
+    # File is stored as: "{document_id}_{original_filename}"
+    stored_name = file_path.name
+    original_filename = stored_name[len(document_id) + 1:]  # Remove "uuid_"
+
     # Delete existing index entries
     pipeline.delete_document(document_id)
     logger.info(f"Deleted existing index for {document_id}")
 
-    # Re-ingest
+    # Re-ingest with original filename preserved
     result = pipeline.ingest(
         file_path=file_path,
         document_id=document_id,
+        original_filename=original_filename,
     )
 
     return IngestResponse(
         document_id=result.document_id,
-        filename=file_path.name,
+        filename=original_filename,
         chunks_indexed=result.chunks_indexed,
         page_count=result.page_count,
         word_count=result.word_count,
