@@ -1,9 +1,9 @@
 """
-query.py — Question Answering Endpoint
+query.py — Question Answering Endpoints
 =======================================
-POST /api/v1/query — Ask a question, get an answer with sources.
-GET  /api/v1/models — List available Ollama models.
-GET  /api/v1/stats  — Detailed system statistics.
+POST /api/v1/query  — Ask a question
+GET  /api/v1/models — List Ollama models
+GET  /api/v1/stats  — System statistics
 """
 
 from fastapi import APIRouter, HTTPException, Request
@@ -16,6 +16,7 @@ from backend.models.request_models import (
     StatsResponse,
 )
 from backend.utils.logger import logger
+from backend.utils.query_processor import preprocess_query
 
 router = APIRouter(prefix="/api/v1", tags=["query"])
 
@@ -33,14 +34,15 @@ async def query_documents(
     """
     Answer a question using the RAG pipeline.
 
-    1. Embeds the query
-    2. Searches FAISS for relevant chunks
-    3. Sends chunks + query to Ollama LLM
-    4. Returns answer with source citations
+    1. Preprocess and validate the query
+    2. Embed the query
+    3. Search FAISS for relevant chunks
+    4. Send chunks + query to Ollama LLM
+    5. Return answer with source citations
     """
     pipeline = request.app.state.pipeline
 
-    # Check index has documents
+    # ── Check index has documents ──────────────────────────────────
     if pipeline.vector_store.is_empty:
         raise HTTPException(
             status_code=400,
@@ -50,18 +52,24 @@ async def query_documents(
             ),
         )
 
-    logger.info(f"Query received: '{body.query[:60]}'")
+    # ── Preprocess query ───────────────────────────────────────────
+    try:
+        clean_query = preprocess_query(body.query)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
-    # Run RAG pipeline
+    logger.info(f"Query received: '{clean_query[:60]}'")
+
+    # ── Run RAG pipeline ───────────────────────────────────────────
     response = pipeline.ask(
-        query=body.query,
+        query=clean_query,
         top_k=body.top_k,
         score_threshold=body.score_threshold,
         filter_document_id=body.filter_document_id,
         temperature=body.temperature,
     )
 
-    # Build source response objects
+    # ── Build source response objects ──────────────────────────────
     sources = [
         SourceResponse(
             filename=src.filename,
@@ -74,7 +82,7 @@ async def query_documents(
     ]
 
     return QueryResponse(
-        query=response.query,
+        query=clean_query,
         answer=response.answer,
         sources=sources,
         model=response.model,

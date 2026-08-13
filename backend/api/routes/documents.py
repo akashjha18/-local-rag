@@ -18,6 +18,7 @@ from backend.models.request_models import (
     DocumentResponse,
     IngestResponse,
 )
+from backend.utils.file_utils import compute_content_hash
 from backend.utils.logger import logger
 
 router = APIRouter(prefix="/api/v1/documents", tags=["documents"])
@@ -41,10 +42,11 @@ async def upload_document(
 
     Steps:
     1. Validate file type and size
-    2. Save to data/documents/ with UUID prefix
-    3. Process with original filename stored in metadata
-    4. Store in FAISS index
-    5. Return indexing statistics with real filename
+    2. Check for duplicate (same file already indexed)
+    3. Save to data/documents/ with UUID prefix
+    4. Process with original filename stored in metadata
+    5. Store in FAISS index
+    6. Return indexing statistics with real filename
     """
     pipeline = request.app.state.pipeline
     settings = get_settings()
@@ -72,7 +74,10 @@ async def upload_document(
     if size_mb > MAX_FILE_SIZE_MB:
         raise HTTPException(
             status_code=413,
-            detail=f"File too large: {size_mb:.1f}MB. Maximum: {MAX_FILE_SIZE_MB}MB",
+            detail=(
+                f"File too large: {size_mb:.1f}MB. "
+                f"Maximum: {MAX_FILE_SIZE_MB}MB"
+            ),
         )
 
     if len(content) == 0:
@@ -81,12 +86,39 @@ async def upload_document(
             detail="Uploaded file is empty",
         )
 
+    # ── Duplicate Detection ────────────────────────────────────────
+    # Compute SHA-256 hash of file content.
+    # If the exact same file was already uploaded, return existing doc
+    # instead of re-indexing it (saves time and storage).
+    content_hash = compute_content_hash(content)
+
+    existing_docs = pipeline.get_indexed_documents()
+    for doc in existing_docs:
+        # Check stored hash against current file hash
+        if doc.get("content_hash") == content_hash:
+            logger.info(
+                f"Duplicate detected: '{original_filename}' matches "
+                f"existing document '{doc['filename']}' "
+                f"(id={doc['document_id']})"
+            )
+            return IngestResponse(
+                document_id=doc["document_id"],
+                filename=doc["filename"],
+                chunks_indexed=doc["chunk_count"],
+                page_count=0,
+                word_count=0,
+                processing_time=0.0,
+                status="duplicate",
+                error=None,
+            )
+
     # ── Generate unique document ID ────────────────────────────────
     document_id = str(uuid.uuid4())
 
     # ── Save file to disk with UUID prefix ─────────────────────────
     # UUID prefix prevents filename collisions when multiple users
-    # upload files with the same name
+    # upload files with the same name.
+    # Format: "{document_id}_{original_filename}"
     docs_dir = Path(settings.documents_dir)
     docs_dir.mkdir(parents=True, exist_ok=True)
 
@@ -114,7 +146,7 @@ async def upload_document(
     result = pipeline.ingest(
         file_path=file_path,
         document_id=document_id,
-        original_filename=original_filename,  # ← THE KEY FIX
+        original_filename=original_filename,
     )
 
     if result.status == "failed":
@@ -133,7 +165,7 @@ async def upload_document(
 
     return IngestResponse(
         document_id=result.document_id,
-        filename=original_filename,        # Always return real filename
+        filename=original_filename,
         chunks_indexed=result.chunks_indexed,
         page_count=result.page_count,
         word_count=result.word_count,
@@ -226,7 +258,7 @@ async def reindex_document(
     pipeline = request.app.state.pipeline
     settings = get_settings()
 
-    # Find the file on disk
+    # Find the file on disk by document_id prefix
     docs_dir = Path(settings.documents_dir)
     matching_files = list(docs_dir.glob(f"{document_id}_*"))
 
@@ -239,9 +271,9 @@ async def reindex_document(
     file_path = matching_files[0]
 
     # Extract original filename by removing UUID prefix
-    # File is stored as: "{document_id}_{original_filename}"
+    # File stored as: "{document_id}_{original_filename}"
     stored_name = file_path.name
-    original_filename = stored_name[len(document_id) + 1:]  # Remove "uuid_"
+    original_filename = stored_name[len(document_id) + 1:]
 
     # Delete existing index entries
     pipeline.delete_document(document_id)
